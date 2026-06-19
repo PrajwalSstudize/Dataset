@@ -49,6 +49,7 @@ from mineru.cli.client_side_output import regenerate_client_side_outputs
 from mineru.cli.output_paths import resolve_parse_dir
 from mineru.cli.vlm_preload import resolve_gradio_local_api_cli_args
 from mineru.cli.visualization import VisualizationJob, run_visualization_job
+from mineru.postprocess.qa_json import generate_qa_json
 from mineru.utils.ocr_language import PUBLIC_OCR_LANGUAGE_CHOICES
 
 _gradio_local_api_server = _api_client.ReusableLocalAPIServer()
@@ -227,6 +228,7 @@ STATUS_CHECKING_SERVER = "Checking server status..."
 STATUS_SUBMITTING_TASK = "Submitting task..."
 STATUS_DOWNLOADING_RESULT = "Task completed, downloading result..."
 STATUS_PROCESSING_OUTPUT = "Preparing outputs..."
+STATUS_GENERATING_QA_JSON = "Generating QA JSON..."
 STATUS_COMPLETED = "Completed"
 STATUS_QUEUED_ON_SERVER = "Queued on server"
 STATUS_PROCESSING_ON_SERVER = "Processing on server"
@@ -243,6 +245,12 @@ STATUS_STEP_DEFINITIONS = [
     ("status_step_download", STATUS_DOWNLOADING_RESULT),
     ("status_step_outputs", STATUS_PROCESSING_OUTPUT),
     ("status_step_done", STATUS_COMPLETED),
+]
+
+QA_DOCUMENT_TYPE_CHOICES = [
+    ("Markdown only", "none"),
+    ("Questions", "questions"),
+    ("Answers", "answers"),
 ]
 
 
@@ -882,6 +890,13 @@ def should_use_client_side_output_generation(client_side_output_generation):
     return client_side_output_generation
 
 
+def resolve_qa_json_model_base_url(backend, url):
+    """Use the selected OpenAI-compatible http-client server for QA JSON when available."""
+    if isinstance(backend, str) and backend.endswith("-http-client") and url:
+        return url
+    return os.getenv("MINERU_QA_JSON_BASE_URL")
+
+
 def create_gradio_run_paths(file_path, output_root="./output"):
     run_id = f"{time.strftime('%y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{safe_stem(Path(file_path).stem)}"
     run_root = Path(output_root) / "gradio" / run_id
@@ -1014,12 +1029,13 @@ async def _run_to_markdown_job(
     language="ch",
     backend="pipeline",
     url=None,
+    qa_document_type="none",
     api_url=None,
     client_side_output_generation=False,
     status_callback: Callable[[str], None] | None = None,
 ):
     if file_path is None:
-        return "", "", "", None, None
+        return "", "", "", "", None, None
 
     def emit_status(message: str) -> None:
         if status_callback is not None:
@@ -1136,6 +1152,20 @@ async def _run_to_markdown_job(
         parse_method=parse_method,
     )
 
+    final_json_content = ""
+    if qa_document_type != "none":
+        emit_status(STATUS_GENERATING_QA_JSON)
+        final_json_path = generate_qa_json(
+            local_md_dir,
+            file_name,
+            qa_document_type,
+            model_base_url=resolve_qa_json_model_base_url(backend, url),
+            model_name=os.getenv("MINERU_QA_JSON_MODEL"),
+            api_key=os.getenv("MINERU_QA_JSON_API_KEY", "EMPTY"),
+        )
+        if final_json_path is not None:
+            final_json_content = final_json_path.read_text(encoding="utf-8")
+
     zip_archive_success = compress_directory_to_zip(local_md_dir, archive_zip_path)
     if zip_archive_success == 0:
         logger.info('Compression successful')
@@ -1152,7 +1182,7 @@ async def _run_to_markdown_job(
         preview_pdf_path = None
 
     emit_status(STATUS_COMPLETED)
-    return md_content, txt_content, content_list_json, str(archive_zip_path), preview_pdf_path
+    return md_content, txt_content, content_list_json, final_json_content, str(archive_zip_path), preview_pdf_path
 
 
 async def stream_to_markdown(
@@ -1166,6 +1196,7 @@ async def stream_to_markdown(
     language="ch",
     backend="pipeline",
     url=None,
+    qa_document_type="none",
     api_url=None,
     client_side_output_generation=False,
 ):
@@ -1173,7 +1204,7 @@ async def stream_to_markdown(
     job_task: asyncio.Task | None = None
     queue_get_task: asyncio.Task | None = None
     timer_task: asyncio.Task | None = None
-    yield status_state.render(), None, "", "", "", gr.skip()
+    yield status_state.render(), None, "", "", "", "", gr.skip()
 
     if file_path is None:
         return
@@ -1197,6 +1228,7 @@ async def stream_to_markdown(
                 language=language,
                 backend=backend,
                 url=url,
+                qa_document_type=qa_document_type,
                 api_url=api_url,
                 client_side_output_generation=client_side_output_generation,
                 status_callback=enqueue_status,
@@ -1227,10 +1259,10 @@ async def stream_to_markdown(
             if queue_get_task in done:
                 message = queue_get_task.result()
                 if status_state.append(message):
-                    yield status_state.render(), None, "", "", "", gr.skip()
+                    yield status_state.render(), None, "", "", "", "", gr.skip()
             elif timer_task is not None and timer_task in done:
                 if status_state.tick():
-                    yield status_state.render(), None, "", "", "", gr.skip()
+                    yield status_state.render(), None, "", "", "", "", gr.skip()
             else:
                 queue_get_task.cancel()
                 await asyncio.gather(queue_get_task, return_exceptions=True)
@@ -1247,7 +1279,7 @@ async def stream_to_markdown(
             status_state.append(status_queue.get_nowait())
     except Exception as exc:
         status_state.append(format_failed_status(exc))
-        yield status_state.render(), None, "", "", "", gr.skip()
+        yield status_state.render(), None, "", "", "", "", gr.skip()
         raise
     finally:
         for task in (queue_get_task, timer_task, job_task):
@@ -1257,10 +1289,10 @@ async def stream_to_markdown(
             await asyncio.gather(task, return_exceptions=True)
 
     try:
-        md_content, txt_content, content_list_json, archive_zip_path, preview_pdf_path = await job_task
+        md_content, txt_content, content_list_json, final_json_content, archive_zip_path, preview_pdf_path = await job_task
     except Exception as exc:
         status_state.append(format_failed_status(exc))
-        yield status_state.render(), None, "", "", "", gr.skip()
+        yield status_state.render(), None, "", "", "", "", gr.skip()
         raise
 
     status_state.append(STATUS_COMPLETED)
@@ -1270,6 +1302,7 @@ async def stream_to_markdown(
         md_content,
         txt_content,
         content_list_json,
+        final_json_content,
         preview_pdf_path,
     )
 
@@ -1619,6 +1652,9 @@ def main(ctx,
             "md_rendering": "Markdown rendering",
             "md_text": "Markdown text",
             "content_list_json": "JSON Content List",
+            "qa_document_type": "Exam JSON",
+            "qa_document_type_info": "Generate a final JSON file for question or answer PDFs after Markdown conversion.",
+            "qa_final_json": "Final JSON",
             "status_idle_title": "Waiting",
             "status_idle_hint": "Upload a file and start conversion.",
             "status_latest": "Latest status",
@@ -1695,6 +1731,9 @@ def main(ctx,
             "md_rendering": "Markdown 渲染",
             "md_text": "Markdown 文本",
             "content_list_json": "JSON 内容列表",
+            "qa_document_type": "试题 JSON",
+            "qa_document_type_info": "Markdown 转换完成后，为题目或答案 PDF 生成最终 JSON 文件。",
+            "qa_final_json": "最终 JSON",
             "status_idle_title": "等待任务",
             "status_idle_hint": "上传文件后开始转换。",
             "status_latest": "最新状态",
@@ -1795,6 +1834,7 @@ def main(ctx,
         language="ch",
         backend="pipeline",
         url=None,
+        qa_document_type="none",
         request: gr.Request = None,
     ):
         request_locale = resolve_request_locale(request)
@@ -1809,6 +1849,7 @@ def main(ctx,
             language=language,
             backend=backend,
             url=url,
+            qa_document_type=qa_document_type,
             api_url=api_url,
             client_side_output_generation=client_side_output_generation,
         ):
@@ -1849,6 +1890,12 @@ def main(ctx,
                         placeholder='http://localhost:30000',
                         info=i18n("server_url_info"),
                     )
+                qa_document_type = gr.Radio(
+                    QA_DOCUMENT_TYPE_CHOICES,
+                    label=i18n("qa_document_type"),
+                    value="none",
+                    info=i18n("qa_document_type_info"),
+                )
                 # 下面这些选项在上传 office 文件时会被自动隐藏
                 with gr.Group() as options_group:
                     max_pages = gr.Slider(1, max_convert_pages, max_convert_pages, step=1, label=i18n("max_pages"))
@@ -1923,6 +1970,16 @@ def main(ctx,
                             show_label=False,
                             elem_classes=["mineru-content-list-json"],
                         )
+                    with gr.Tab(i18n("qa_final_json")):
+                        qa_final_json = gr.Code(
+                            lines=28,
+                            language="json",
+                            label=i18n("qa_final_json"),
+                            interactive=False,
+                            wrap_lines=True,
+                            show_label=False,
+                            elem_classes=["mineru-qa-final-json"],
+                        )
 
         if example_enable:
             example_root = os.path.join(os.getcwd(), 'examples')
@@ -1996,7 +2053,7 @@ def main(ctx,
             outputs=[is_ocr, formula_enable, backend],
             **_private_api_kwargs
         )
-        clear_bu.add([input_file, md, doc_show, md_text, content_list_json, output_file, is_ocr, office_html, status_panel])
+        clear_bu.add([input_file, md, doc_show, md_text, content_list_json, qa_final_json, output_file, is_ocr, office_html, status_panel])
 
         def reset_primary_ui():
             """清除主界面状态。高级气泡由前端点击外部逻辑自动收起。"""
@@ -2006,13 +2063,14 @@ def main(ctx,
                 gr.update(value="", visible=False),
                 gr.update(value=render_status_steps_html("", i18n)),
                 gr.update(value=""),
+                gr.update(value=""),
             )
 
         # 清除按钮额外重置 UI 可见性（ClearButton 不一定触发 input_file.change）
         clear_bu.click(
             fn=reset_primary_ui,
             inputs=[],
-            outputs=[options_group, doc_show, office_html, status_panel, content_list_json],
+            outputs=[options_group, doc_show, office_html, status_panel, content_list_json, qa_final_json],
             **_private_api_kwargs
         )
 
@@ -2049,8 +2107,8 @@ def main(ctx,
         )
         change_bu.click(
             fn=convert_to_markdown_stream,
-            inputs=[input_file, max_pages, is_ocr, formula_enable, table_enable, image_analysis, hybrid_effort, language, backend, url],
-            outputs=[status_panel, output_file, md, md_text, content_list_json, doc_show],
+            inputs=[input_file, max_pages, is_ocr, formula_enable, table_enable, image_analysis, hybrid_effort, language, backend, url, qa_document_type],
+            outputs=[status_panel, output_file, md, md_text, content_list_json, qa_final_json, doc_show],
             **_to_md_api_kwargs
         )
 
