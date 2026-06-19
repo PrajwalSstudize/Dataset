@@ -26,6 +26,28 @@ HTML_IMAGE_RE = re.compile(
     r"<img\b[^>]*?\bsrc\s*=\s*(?P<quote>[\"'])(?P<src>.*?)(?P=quote)",
     re.IGNORECASE,
 )
+SUB_TAG_RE = re.compile(r"</?\s*sub\s*>", re.IGNORECASE)
+SUP_TAG_RE = re.compile(r"</?\s*sup\s*>", re.IGNORECASE)
+HTML_TAG_RE = re.compile(r"</?(?!img\b)[a-zA-Z][^>]*>")
+MATH_SYMBOL_REPLACEMENTS = {
+    "\uf06c": "λ",
+    "\u03bb": "λ",
+    "\uf06d": "μ",
+    "\u03bc": "μ",
+    "\u00b5": "μ",
+    "\uf070": "π",
+    "\u03c0": "π",
+    "\uf077": "ω",
+    "\u03c9": "ω",
+    "\uf066": "φ",
+    "\u03c6": "φ",
+    "\u03d5": "φ",
+    "\uf071": "θ",
+    "\u03b8": "θ",
+    "\uf0de": "=>",
+    "\uf0b4": "therefore",
+    "\u212b": "Å",
+}
 
 
 @dataclass
@@ -197,6 +219,12 @@ def build_extraction_prompt(
         "Images found in the Markdown are listed by their exact path. If an image belongs to an item, "
         "set that item's img field to that exact image path. If no image belongs to it, set img to null."
     )
+    cleanup_instruction = (
+        "Clean OCR/math artifacts in question, option, and solution text: convert private-use glyphs such as "
+        " to λ/lambda,  to μ/mu, π/omega/phi/theta symbols to readable math text, remove malformed repeated "
+        "<sub>/<sup> tags, and rewrite subscript/superscript notation as readable plain text like I_max, I_min, "
+        "S_1, S_2, λ/2, or H_2O. Do not leave raw broken HTML tags in the JSON."
+    )
     if document_type == "questions":
         schema_instruction = """Return only valid JSON using this exact schema:
 {
@@ -212,7 +240,7 @@ def build_extraction_prompt(
 }"""
         task_instruction = (
             "Extract every physics multiple-choice question. Options may be inline or split across lines. "
-            "Keep formulas and OCR symbols as faithfully as possible. Do not solve the questions."
+            "Keep formulas semantically faithful while cleaning OCR artifacts. Do not solve the questions."
         )
     else:
         schema_instruction = """Return only valid JSON using this exact schema:
@@ -241,6 +269,7 @@ Rules:
 - Do not invent missing items.
 - Preserve item numbering from the source.
 - Normalize option labels to "(a)", "(b)", "(c)", "(d)" for questions.
+- {cleanup_instruction}
 - {image_instruction}
 
 Image paths:
@@ -303,7 +332,7 @@ def normalize_model_question(item: Any, parse_dir: str | Path) -> dict[str, Any]
     return {
         "page_no": item.get("page_no"),
         "question_number": int(item.get("question_number")),
-        "question": normalize_space(str(item.get("question", ""))),
+        "question": clean_exam_text(str(item.get("question", ""))),
         "options": normalize_options(item.get("options", [])),
         "img": normalize_model_img(item.get("img"), parse_dir),
     }
@@ -317,7 +346,7 @@ def normalize_model_answer(item: Any, parse_dir: str | Path) -> dict[str, Any]:
     return {
         "Index": str(item.get("Index", "")).strip(),
         "correctOption": correct_option,
-        "SolutionData": normalize_space(str(item.get("SolutionData", ""))),
+        "SolutionData": clean_exam_text(str(item.get("SolutionData", ""))),
         "img": normalize_model_img(item.get("img"), parse_dir),
     }
 
@@ -327,10 +356,10 @@ def normalize_options(options: Any) -> list[str]:
         return []
     normalized = []
     for option in options:
-        option_text = normalize_space(str(option))
+        option_text = clean_exam_text(str(option))
         match = re.match(r"^\(?([a-dA-D])\)?[\).:-]?\s*(.*)$", option_text)
         if match:
-            option_text = f"({match.group(1).lower()}) {match.group(2).strip()}".strip()
+            option_text = clean_exam_text(f"({match.group(1).lower()}) {match.group(2).strip()}".strip())
         if option_text:
             normalized.append(option_text)
     return normalized
@@ -401,8 +430,8 @@ def parse_questions(markdown_text: str, parse_dir: str | Path) -> list[dict[str,
             {
                 "page_no": None,
                 "question_number": block.number,
-                "question": normalize_space(question_text),
-                "options": options,
+                "question": clean_exam_text(question_text),
+                "options": [clean_exam_text(option) for option in options],
                 "img": encode_images(block.images, parse_dir),
             }
         )
@@ -424,7 +453,7 @@ def parse_answers(markdown_text: str, parse_dir: str | Path) -> list[dict[str, A
             {
                 "Index": str(block.number),
                 "correctOption": correct_option,
-                "SolutionData": normalize_space(body),
+                "SolutionData": clean_exam_text(body),
                 "img": encode_images(block.images, parse_dir),
             }
         )
@@ -486,6 +515,31 @@ def normalize_answer_text(text: str) -> str:
 
 def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def clean_exam_text(text: str) -> str:
+    text = normalize_ocr_symbols(str(text))
+    for source, replacement in MATH_SYMBOL_REPLACEMENTS.items():
+        text = text.replace(source, replacement)
+    text = normalize_repeated_scripts(text, "sub")
+    text = normalize_repeated_scripts(text, "sup")
+    text = SUB_TAG_RE.sub("_", text)
+    text = SUP_TAG_RE.sub("^", text)
+    text = HTML_TAG_RE.sub(" ", text)
+    text = re.sub(r"_+", "_", text)
+    text = re.sub(r"\^+", "^", text)
+    text = re.sub(r"\s*([_^])\s*", r"\1", text)
+    text = re.sub(r"([_^])([,.;:)\]}])", r"\2", text)
+    text = re.sub(r"([(\[{])([_^])", r"\1", text)
+    return normalize_space(text)
+
+
+def normalize_repeated_scripts(text: str, tag_name: Literal["sub", "sup"]) -> str:
+    marker = "_" if tag_name == "sub" else "^"
+    open_tag = re.compile(rf"(?:<\s*{tag_name}\s*>)+", re.IGNORECASE)
+    close_tag = re.compile(rf"(?:<\s*/\s*{tag_name}\s*>)+", re.IGNORECASE)
+    text = open_tag.sub(marker, text)
+    return close_tag.sub("", text)
 
 
 def encode_images(image_sources: list[str], parse_dir: str | Path) -> str | None:

@@ -5,11 +5,11 @@ import html as html_lib
 import httpx
 import os
 import re
+import shutil
 import sys
 import threading
 import time
 import uuid
-import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -668,30 +668,6 @@ def format_remote_status_message(
     return f"Task status: {status}"
 
 
-def compress_directory_to_zip(directory_path, output_zip_path):
-    """压缩指定目录到一个 ZIP 文件。
-
-    :param directory_path: 要压缩的目录路径
-    :param output_zip_path: 输出的 ZIP 文件路径
-    """
-    try:
-        with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-
-            # 遍历目录中的所有文件和子目录
-            for root, dirs, files in os.walk(directory_path):
-                for file in files:
-                    # 构建完整的文件路径
-                    file_path = os.path.join(root, file)
-                    # 计算相对路径
-                    arcname = os.path.relpath(file_path, directory_path)
-                    # 添加文件到 ZIP 文件
-                    zipf.write(file_path, arcname)
-        return 0
-    except Exception as e:
-        logger.exception(e)
-        return -1
-
-
 GRADIO_PREVIEW_IMAGE_SUFFIXES = {
     ".jpg",
     ".jpeg",
@@ -897,12 +873,26 @@ def resolve_qa_json_model_base_url(backend, url):
     return os.getenv("MINERU_QA_JSON_BASE_URL")
 
 
+def clean_previous_gradio_outputs(output_root="./output"):
+    gradio_root = Path(output_root) / "gradio"
+    if not gradio_root.exists():
+        return
+    for child in gradio_root.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning(f"Failed to clean previous Gradio output {child}: {exc}")
+
+
 def create_gradio_run_paths(file_path, output_root="./output"):
+    clean_previous_gradio_outputs(output_root)
     run_id = f"{time.strftime('%y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{safe_stem(Path(file_path).stem)}"
     run_root = Path(output_root) / "gradio" / run_id
     extract_root = run_root / "result"
-    archive_zip_path = run_root / f"{safe_stem(Path(file_path).stem)}.zip"
-    return run_root, extract_root, archive_zip_path
+    return run_root, extract_root
 
 
 def build_gradio_allowed_paths(output_root="./output"):
@@ -1035,7 +1025,7 @@ async def _run_to_markdown_job(
     status_callback: Callable[[str], None] | None = None,
 ):
     if file_path is None:
-        return "", "", "", "", None, None
+        return "", "", "", "", None, None, None
 
     def emit_status(message: str) -> None:
         if status_callback is not None:
@@ -1048,7 +1038,7 @@ async def _run_to_markdown_job(
         client_side_output_generation
     )
     parse_method = resolve_parse_method(file_path, is_ocr, backend)
-    run_root, extract_root, archive_zip_path = create_gradio_run_paths(file_path)
+    run_root, extract_root = create_gradio_run_paths(file_path)
     run_root.mkdir(parents=True, exist_ok=True)
 
     form_data = _api_client.build_parse_request_form_data(
@@ -1153,6 +1143,7 @@ async def _run_to_markdown_job(
     )
 
     final_json_content = ""
+    final_json_download_path = None
     if qa_document_type != "none":
         emit_status(STATUS_GENERATING_QA_JSON)
         final_json_path = generate_qa_json(
@@ -1164,13 +1155,8 @@ async def _run_to_markdown_job(
             api_key=os.getenv("MINERU_QA_JSON_API_KEY", "EMPTY"),
         )
         if final_json_path is not None:
+            final_json_download_path = str(final_json_path)
             final_json_content = final_json_path.read_text(encoding="utf-8")
-
-    zip_archive_success = compress_directory_to_zip(local_md_dir, archive_zip_path)
-    if zip_archive_success == 0:
-        logger.info('Compression successful')
-    else:
-        logger.error('Compression failed')
 
     md_path = Path(local_md_dir) / f"{file_name}.md"
     with open(md_path, 'r', encoding='utf-8') as f:
@@ -1182,7 +1168,7 @@ async def _run_to_markdown_job(
         preview_pdf_path = None
 
     emit_status(STATUS_COMPLETED)
-    return md_content, txt_content, content_list_json, final_json_content, str(archive_zip_path), preview_pdf_path
+    return md_content, txt_content, content_list_json, final_json_content, str(md_path), final_json_download_path, preview_pdf_path
 
 
 async def stream_to_markdown(
@@ -1204,7 +1190,7 @@ async def stream_to_markdown(
     job_task: asyncio.Task | None = None
     queue_get_task: asyncio.Task | None = None
     timer_task: asyncio.Task | None = None
-    yield status_state.render(), None, "", "", "", "", gr.skip()
+    yield status_state.render(), None, None, "", "", "", "", gr.skip()
 
     if file_path is None:
         return
@@ -1259,10 +1245,10 @@ async def stream_to_markdown(
             if queue_get_task in done:
                 message = queue_get_task.result()
                 if status_state.append(message):
-                    yield status_state.render(), None, "", "", "", "", gr.skip()
+                    yield status_state.render(), None, None, "", "", "", "", gr.skip()
             elif timer_task is not None and timer_task in done:
                 if status_state.tick():
-                    yield status_state.render(), None, "", "", "", "", gr.skip()
+                    yield status_state.render(), None, None, "", "", "", "", gr.skip()
             else:
                 queue_get_task.cancel()
                 await asyncio.gather(queue_get_task, return_exceptions=True)
@@ -1279,7 +1265,7 @@ async def stream_to_markdown(
             status_state.append(status_queue.get_nowait())
     except Exception as exc:
         status_state.append(format_failed_status(exc))
-        yield status_state.render(), None, "", "", "", "", gr.skip()
+        yield status_state.render(), None, None, "", "", "", "", gr.skip()
         raise
     finally:
         for task in (queue_get_task, timer_task, job_task):
@@ -1289,16 +1275,17 @@ async def stream_to_markdown(
             await asyncio.gather(task, return_exceptions=True)
 
     try:
-        md_content, txt_content, content_list_json, final_json_content, archive_zip_path, preview_pdf_path = await job_task
+        md_content, txt_content, content_list_json, final_json_content, md_download_path, final_json_download_path, preview_pdf_path = await job_task
     except Exception as exc:
         status_state.append(format_failed_status(exc))
-        yield status_state.render(), None, "", "", "", "", gr.skip()
+        yield status_state.render(), None, None, "", "", "", "", gr.skip()
         raise
 
     status_state.append(STATUS_COMPLETED)
     yield (
         status_state.render(),
-        archive_zip_path,
+        md_download_path,
+        final_json_download_path,
         md_content,
         txt_content,
         content_list_json,
@@ -1649,6 +1636,8 @@ def main(ctx,
             "convert_status": "Conversion Status",
             "convert_result": "Convert result",
             "result_file": "Result file",
+            "md_download_file": "Markdown file",
+            "qa_json_download_file": "Final JSON file",
             "md_rendering": "Markdown rendering",
             "md_text": "Markdown text",
             "content_list_json": "JSON Content List",
@@ -1728,6 +1717,8 @@ def main(ctx,
             "convert_status": "转换状态",
             "convert_result": "转换结果",
             "result_file": "结果文件",
+            "md_download_file": "Markdown 文件",
+            "qa_json_download_file": "最终 JSON 文件",
             "md_rendering": "Markdown 渲染",
             "md_text": "Markdown 文本",
             "content_list_json": "JSON 内容列表",
@@ -1908,9 +1899,14 @@ def main(ctx,
                     change_bu = gr.Button(i18n("convert"), variant="primary", scale=1, min_width=0)
                     clear_bu = gr.ClearButton(value=i18n("clear"), scale=1, min_width=0)
                 output_file = gr.File(
-                    label=i18n("convert_result"),
+                    label=i18n("md_download_file"),
                     interactive=False,
                     elem_classes=["mineru-result-file"],
+                )
+                qa_json_file = gr.File(
+                    label=i18n("qa_json_download_file"),
+                    interactive=False,
+                    elem_classes=["mineru-qa-json-file"],
                 )
                 status_panel = gr.HTML(
                     value=render_status_steps_html("", i18n),
@@ -2053,7 +2049,7 @@ def main(ctx,
             outputs=[is_ocr, formula_enable, backend],
             **_private_api_kwargs
         )
-        clear_bu.add([input_file, md, doc_show, md_text, content_list_json, qa_final_json, output_file, is_ocr, office_html, status_panel])
+        clear_bu.add([input_file, md, doc_show, md_text, content_list_json, qa_final_json, output_file, qa_json_file, is_ocr, office_html, status_panel])
 
         def reset_primary_ui():
             """清除主界面状态。高级气泡由前端点击外部逻辑自动收起。"""
@@ -2064,13 +2060,15 @@ def main(ctx,
                 gr.update(value=render_status_steps_html("", i18n)),
                 gr.update(value=""),
                 gr.update(value=""),
+                gr.update(value=None),
+                gr.update(value=None),
             )
 
         # 清除按钮额外重置 UI 可见性（ClearButton 不一定触发 input_file.change）
         clear_bu.click(
             fn=reset_primary_ui,
             inputs=[],
-            outputs=[options_group, doc_show, office_html, status_panel, content_list_json, qa_final_json],
+            outputs=[options_group, doc_show, office_html, status_panel, content_list_json, qa_final_json, output_file, qa_json_file],
             **_private_api_kwargs
         )
 
@@ -2108,7 +2106,7 @@ def main(ctx,
         change_bu.click(
             fn=convert_to_markdown_stream,
             inputs=[input_file, max_pages, is_ocr, formula_enable, table_enable, image_analysis, hybrid_effort, language, backend, url, qa_document_type],
-            outputs=[status_panel, output_file, md, md_text, content_list_json, qa_final_json, doc_show],
+            outputs=[status_panel, output_file, qa_json_file, md, md_text, content_list_json, qa_final_json, doc_show],
             **_to_md_api_kwargs
         )
 

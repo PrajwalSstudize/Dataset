@@ -2,7 +2,7 @@
 import base64
 import json
 
-from mineru.postprocess.qa_json import extract_with_model, generate_qa_json, parse_answers, parse_questions
+from mineru.postprocess.qa_json import clean_exam_text, extract_with_model, generate_qa_json, parse_answers, parse_questions
 
 
 QUESTION_SAMPLE = """1. If two light waves having same frequency have intensity ratio 4 : 1 and they interfere, the ratio of maximum to minimum
@@ -117,3 +117,59 @@ def test_model_extraction_is_used_before_rule_fallback(tmp_path):
     assert payload["questions"][0]["question"] == "Structured by model"
     assert payload["questions"][0]["options"][0] == "(a) first"
     assert payload["questions"][0]["img"] == f"data:image/png;base64,{expected_base64}"
+
+
+def test_clean_exam_text_normalizes_math_glyphs_and_broken_sub_tags():
+    cleaned = clean_exam_text("Given \uf06c = 5898Å and \uf06d = 1.5, I<sub><sub>max</sub></sub> / I<sub>min</sub>")
+
+    assert "λ = 5898Å" in cleaned
+    assert "μ = 1.5" in cleaned
+    assert "I_max" in cleaned
+    assert "I_min" in cleaned
+    assert "<sub>" not in cleaned
+
+
+def test_model_output_cleanup_applies_to_questions_and_answers():
+    question_payload = extract_with_model(
+        "1. raw",
+        ".",
+        "questions",
+        model_name="qa-model",
+        model_caller=lambda model, messages: json.dumps(
+            {
+                "questions": [
+                    {
+                        "page_no": None,
+                        "question_number": 1,
+                        "question": "Find \uf06c when I<sub><sub>max</sub></sub> is given",
+                        "options": ["a \uf06d", "b I<sub>min</sub>"],
+                        "img": None,
+                    }
+                ]
+            }
+        ),
+    )
+    answer_payload = extract_with_model(
+        "1. raw",
+        ".",
+        "answers",
+        model_name="qa-model",
+        model_caller=lambda model, messages: json.dumps(
+            {
+                "answers": [
+                    {
+                        "Index": "1",
+                        "correctOption": "a",
+                        "SolutionData": "Use \uf06c/2 and I<sub><sub>min</sub></sub>",
+                        "img": None,
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert "λ" in question_payload["questions"][0]["question"]
+    assert "I_max" in question_payload["questions"][0]["question"]
+    assert question_payload["questions"][0]["options"][0] == "(a) μ"
+    assert "λ/2" in answer_payload["answers"][0]["SolutionData"]
+    assert "I_min" in answer_payload["answers"][0]["SolutionData"]
