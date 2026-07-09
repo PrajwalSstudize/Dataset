@@ -49,6 +49,22 @@ MATH_SYMBOL_REPLACEMENTS = {
     "\u212b": "Å",
 }
 
+# Strips the "www.igyanam.com" watermark/credit line that shows up in some
+# source markdown (with or without protocol/www, tolerant of OCR spacing
+# around the dots, e.g. "www . igyanam . com").
+WATERMARK_RE = re.compile(
+    r"(?:https?://)?\s*(?:www\s*\.\s*)?igyanam\s*\.\s*com\b",
+    re.IGNORECASE,
+)
+
+# --- Merged-question detection -------------------------------------------------
+# Matches a numbered-question marker that appears *inside* already-extracted text
+# (i.e. not the leading number MinerU/the model was asked to strip), signalling
+# that two or more questions were merged into a single object.
+EMBEDDED_QUESTION_NUMBER_RE = re.compile(
+    r"(?:\n|\s{2,})(?P<number>\d{1,4})\.\s+(?=[A-Z(])"
+)
+
 
 @dataclass
 class ParsedBlock:
@@ -221,9 +237,11 @@ def build_extraction_prompt(
     )
     cleanup_instruction = (
         "Clean OCR/math artifacts in question, option, and solution text: convert private-use glyphs such as "
-        " to λ/lambda,  to μ/mu, π/omega/phi/theta symbols to readable math text, remove malformed repeated "
+        " to λ/lambda,  to μ/mu, π/omega/phi/theta symbols to readable math text, remove malformed repeated "
         "<sub>/<sup> tags, and rewrite subscript/superscript notation as readable plain text like I_max, I_min, "
-        "S_1, S_2, λ/2, or H_2O. Do not leave raw broken HTML tags in the JSON."
+        "S_1, S_2, λ/2, or H_2O. Do not leave raw broken HTML tags in the JSON. Also remove any occurrence of "
+        "the watermark/credit text \"www.igyanam.com\" (in any casing, spacing, or with/without \"www.\"/protocol) "
+        "from every field -- it must never appear anywhere in the output."
     )
     if document_type == "questions":
         schema_instruction = """Return only valid JSON using this exact schema:
@@ -241,6 +259,7 @@ def build_extraction_prompt(
         task_instruction = (
             "Extract every physics multiple-choice question. Options may be inline or split across lines. "
             "Keep formulas semantically faithful while cleaning OCR artifacts. Do not solve the questions."
+            "Make sure that there should be only one question in single JSON object. Therefor, one question data per JSON"
         )
     else:
         schema_instruction = """Return only valid JSON using this exact schema:
@@ -269,6 +288,7 @@ Rules:
 - Do not invent missing items.
 - Preserve item numbering from the source.
 - Normalize option labels to "(a)", "(b)", "(c)", "(d)" for questions.
+- Never place more than one question's text or option set inside a single JSON question object. Each object in the "questions" array must contain exactly one question and, at most, one set of (a)-(d) options.
 - {cleanup_instruction}
 - {image_instruction}
 
@@ -316,7 +336,8 @@ def normalize_model_payload(
         items = payload.get("questions")
         if not isinstance(items, list):
             raise ValueError("Model output missing questions list.")
-        payload["questions"] = [normalize_model_question(item, parse_dir) for item in items]
+        normalized = [normalize_model_question(item, parse_dir) for item in items]
+        payload["questions"] = split_merged_question_items(normalized)
         return payload
 
     items = payload.get("answers")
@@ -435,7 +456,7 @@ def parse_questions(markdown_text: str, parse_dir: str | Path) -> list[dict[str,
                 "img": encode_images(block.images, parse_dir),
             }
         )
-    return questions
+    return split_merged_question_items(questions)
 
 
 def parse_answers(markdown_text: str, parse_dir: str | Path) -> list[dict[str, Any]]:
@@ -519,6 +540,8 @@ def normalize_space(text: str) -> str:
 
 def clean_exam_text(text: str) -> str:
     text = normalize_ocr_symbols(str(text))
+    text = WATERMARK_RE.sub("", text)
+    text = re.sub(r"[(\[{]\s*[)\]}]", "", text)
     for source, replacement in MATH_SYMBOL_REPLACEMENTS.items():
         text = text.replace(source, replacement)
     text = normalize_repeated_scripts(text, "sub")
@@ -573,3 +596,133 @@ def encode_image(image_source: str, parse_dir: str | Path) -> str | None:
     mime_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
     encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
+
+
+# --- Merge guard: enforce one question per JSON object -------------------------
+
+
+def split_merged_question_items(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure no single question object contains more than one question.
+
+    Detects two symptoms of a merge:
+      1. An embedded numbered-question marker inside the `question` text
+         (e.g. "...final answer.\\n7. A block slides down...").
+      2. An `options` list containing more than one full (a)-(d) cycle.
+
+    Any offending item is split into multiple standalone question objects,
+    and the full list is renumbered sequentially afterwards.
+    """
+    expanded: list[dict[str, Any]] = []
+    for item in questions:
+        expanded.extend(_split_single_question_item(item))
+    return _renumber_questions(expanded)
+
+
+def _split_single_question_item(item: dict[str, Any]) -> list[dict[str, Any]]:
+    text = item.get("question", "") or ""
+    options = item.get("options", []) or []
+
+    text_segments = _split_embedded_question_text(text)
+    option_groups = _split_option_cycles(options)
+
+    if len(text_segments) <= 1 and len(option_groups) <= 1:
+        return [item]
+
+    segment_count = max(len(text_segments), len(option_groups))
+
+    if len(text_segments) < segment_count:
+        # Options show more (a)-(d) cycles than we found question-text boundaries
+        # for. We can't know where the missing question's text lives, so we must
+        # never silently drop the orphaned options -- keep them, flagged for
+        # manual review, instead of discarding them.
+        fallback_text = text_segments[-1] if text_segments else text
+        while len(text_segments) < segment_count:
+            text_segments.append(
+                f"{fallback_text} [REVIEW: extra option set detected without matching question text]"
+            )
+
+    option_groups = _pad_to_length(option_groups, segment_count, default=[])
+
+    raw_images = item.get("img")
+    image_list = raw_images if isinstance(raw_images, list) else ([raw_images] if raw_images else [])
+
+    split_items = []
+    for index in range(segment_count):
+        question_text = text_segments[index].strip()
+        if not question_text:
+            continue
+        split_items.append(
+            {
+                "page_no": item.get("page_no"),
+                "question_number": item.get("question_number"),
+                "question": question_text,
+                "options": option_groups[index],
+                "img": image_list[index] if index < len(image_list) else None,
+            }
+        )
+
+    if not split_items:
+        return [item]
+
+    logger.warning(
+        "Detected a merged question object (question_number=%s); split into %d separate question objects.",
+        item.get("question_number"),
+        len(split_items),
+    )
+    return split_items
+
+
+def _split_embedded_question_text(text: str) -> list[str]:
+    if not text:
+        return [text]
+    matches = list(EMBEDDED_QUESTION_NUMBER_RE.finditer(text))
+    if not matches:
+        return [text]
+    segments = []
+    start = 0
+    for match in matches:
+        segment = text[start : match.start()]
+        if segment.strip():
+            segments.append(segment)
+        start = match.end()
+    tail = text[start:]
+    if tail.strip():
+        segments.append(tail)
+    return segments if len(segments) > 1 else [text]
+
+
+def _split_option_cycles(options: list[str]) -> list[list[str]]:
+    if not options:
+        return [[]]
+    groups: list[list[str]] = []
+    current: list[str] = []
+    seen_labels: set[str] = set()
+    for option in options:
+        label_match = re.match(r"^\(([a-dA-D])\)", option)
+        label = label_match.group(1).lower() if label_match else None
+        if label and label in seen_labels:
+            groups.append(current)
+            current = []
+            seen_labels = set()
+        if label:
+            seen_labels.add(label)
+        current.append(option)
+    if current:
+        groups.append(current)
+    return groups or [[]]
+
+
+def _pad_to_length(items: list[Any], length: int, default: Any) -> list[Any]:
+    items = list(items)
+    while len(items) < length:
+        items.append(default)
+    return items
+
+
+def _renumber_questions(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    renumbered = []
+    for index, item in enumerate(questions, start=1):
+        item = dict(item)
+        item["question_number"] = index
+        renumbered.append(item)
+    return renumbered

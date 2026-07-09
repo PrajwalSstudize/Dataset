@@ -7,9 +7,11 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -869,6 +871,10 @@ def should_use_client_side_output_generation(client_side_output_generation):
 def resolve_qa_json_model_base_url(backend, url):
     """Use the selected OpenAI-compatible http-client server for QA JSON when available."""
     if isinstance(backend, str) and backend.endswith("-http-client") and url:
+        logger.info(
+            "QA JSON postprocessing will reuse the same OpenAI-compatible server URL as document conversion: "
+            f"backend={backend}, server_url={url}"
+        )
         return url
     return os.getenv("MINERU_QA_JSON_BASE_URL")
 
@@ -887,12 +893,40 @@ def clean_previous_gradio_outputs(output_root="./output"):
             logger.warning(f"Failed to clean previous Gradio output {child}: {exc}")
 
 
+def get_gradio_download_root():
+    return Path(tempfile.gettempdir()) / "mineru_gradio_downloads"
+
+
+def clean_previous_gradio_downloads():
+    download_root = get_gradio_download_root()
+    if download_root.exists():
+        try:
+            shutil.rmtree(download_root)
+        except Exception as exc:
+            logger.warning(f"Failed to clean previous Gradio downloads {download_root}: {exc}")
+    download_root.mkdir(parents=True, exist_ok=True)
+    return download_root
+
+
 def create_gradio_run_paths(file_path, output_root="./output"):
     clean_previous_gradio_outputs(output_root)
+    download_root = clean_previous_gradio_downloads()
     run_id = f"{time.strftime('%y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{safe_stem(Path(file_path).stem)}"
     run_root = Path(output_root) / "gradio" / run_id
     extract_root = run_root / "result"
-    return run_root, extract_root
+    download_zip_path = download_root / f"{safe_stem(Path(file_path).stem)}.zip"
+    return run_root, extract_root, download_zip_path
+
+
+def compress_directory_to_zip(directory_path, output_zip_path):
+    directory_path = Path(directory_path)
+    output_zip_path = Path(output_zip_path)
+    output_zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(output_zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for file_path in directory_path.rglob("*"):
+            if file_path.is_file():
+                zipf.write(file_path, file_path.relative_to(directory_path))
+    return output_zip_path
 
 
 def build_gradio_allowed_paths(output_root="./output"):
@@ -1038,7 +1072,7 @@ async def _run_to_markdown_job(
         client_side_output_generation
     )
     parse_method = resolve_parse_method(file_path, is_ocr, backend)
-    run_root, extract_root = create_gradio_run_paths(file_path)
+    run_root, extract_root, download_zip_path = create_gradio_run_paths(file_path)
     run_root.mkdir(parents=True, exist_ok=True)
 
     form_data = _api_client.build_parse_request_form_data(
@@ -1150,6 +1184,8 @@ async def _run_to_markdown_job(
             local_md_dir,
             file_name,
             qa_document_type,
+            source_backend=backend,
+            source_server_url=url,
             model_base_url=resolve_qa_json_model_base_url(backend, url),
             model_name=os.getenv("MINERU_QA_JSON_MODEL"),
             api_key=os.getenv("MINERU_QA_JSON_API_KEY", "EMPTY"),
@@ -1163,12 +1199,13 @@ async def _run_to_markdown_job(
         txt_content = f.read()
     md_content = replace_image_with_gradio_file_urls(txt_content, local_md_dir)
     content_list_json = read_gradio_content_list_json(local_md_dir, file_name)
+    result_zip_path = compress_directory_to_zip(local_md_dir, download_zip_path)
 
     if file_suffix in office_suffixes:
         preview_pdf_path = None
 
     emit_status(STATUS_COMPLETED)
-    return md_content, txt_content, content_list_json, final_json_content, str(md_path), final_json_download_path, preview_pdf_path
+    return md_content, txt_content, content_list_json, final_json_content, str(result_zip_path), final_json_download_path, preview_pdf_path
 
 
 async def stream_to_markdown(
@@ -1636,7 +1673,7 @@ def main(ctx,
             "convert_status": "Conversion Status",
             "convert_result": "Convert result",
             "result_file": "Result file",
-            "md_download_file": "Markdown file",
+            "md_download_file": "Result ZIP",
             "qa_json_download_file": "Final JSON file",
             "md_rendering": "Markdown rendering",
             "md_text": "Markdown text",
@@ -1717,7 +1754,7 @@ def main(ctx,
             "convert_status": "转换状态",
             "convert_result": "转换结果",
             "result_file": "结果文件",
-            "md_download_file": "Markdown 文件",
+            "md_download_file": "结果 ZIP",
             "qa_json_download_file": "最终 JSON 文件",
             "md_rendering": "Markdown 渲染",
             "md_text": "Markdown 文本",
