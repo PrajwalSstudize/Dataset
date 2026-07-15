@@ -62,7 +62,7 @@ WATERMARK_RE = re.compile(
 # (i.e. not the leading number MinerU/the model was asked to strip), signalling
 # that two or more questions were merged into a single object.
 EMBEDDED_QUESTION_NUMBER_RE = re.compile(
-    r"(?:\n|\s{2,})(?P<number>\d{1,4})\.\s+(?=[A-Z(])"
+    r"(?:\n|\s+)(?P<number>\d{1,4})\.\s+(?=[A-Z(])"
 )
 
 
@@ -641,7 +641,7 @@ def _split_single_question_item(item: dict[str, Any]) -> list[dict[str, Any]]:
                 f"{fallback_text} [REVIEW: extra option set detected without matching question text]"
             )
 
-    option_groups = _pad_to_length(option_groups, segment_count, default=[])
+    option_groups = _align_option_groups_to_segments(text_segments, option_groups, segment_count)
 
     raw_images = item.get("img")
     image_list = raw_images if isinstance(raw_images, list) else ([raw_images] if raw_images else [])
@@ -651,12 +651,13 @@ def _split_single_question_item(item: dict[str, Any]) -> list[dict[str, Any]]:
         question_text = text_segments[index].strip()
         if not question_text:
             continue
+        parsed_segment = _parse_question_segment(question_text, option_groups[index], index + 1)
         split_items.append(
             {
                 "page_no": item.get("page_no"),
                 "question_number": item.get("question_number"),
-                "question": question_text,
-                "options": option_groups[index],
+                "question": parsed_segment["question"],
+                "options": parsed_segment["options"],
                 "img": image_list[index] if index < len(image_list) else None,
             }
         )
@@ -670,6 +671,44 @@ def _split_single_question_item(item: dict[str, Any]) -> list[dict[str, Any]]:
         len(split_items),
     )
     return split_items
+
+
+def _align_option_groups_to_segments(
+    text_segments: list[str],
+    option_groups: list[list[str]],
+    segment_count: int,
+) -> list[list[str]]:
+    if len(option_groups) == 1 and segment_count > 1:
+        earlier_segments_have_inline_options = any(
+            _segment_contains_option_cycle(segment) for segment in text_segments[:-1]
+        )
+        if earlier_segments_have_inline_options:
+            return ([[]] * (segment_count - 1)) + option_groups
+    return _pad_to_length(option_groups, segment_count, default=[])
+
+
+def _segment_contains_option_cycle(text: str) -> bool:
+    labels = {match.group(1).lower() for match in re.finditer(r"\(([a-dA-D])\)", text)}
+    return {"a", "b", "c", "d"}.issubset(labels)
+
+
+def _parse_question_segment(question_text: str, options: list[str], question_number: int) -> dict[str, Any]:
+    question_text = re.sub(r"^\s*\d{1,4}\.\s*", "", question_text)
+    synthetic_markdown = "\n".join(
+        [f"{question_number}. {question_text}", *options]
+    )
+    parsed_questions = parse_questions(synthetic_markdown, ".")
+    if parsed_questions:
+        parsed_question = dict(parsed_questions[0])
+        parsed_question["question_number"] = question_number
+        return parsed_question
+    return {
+        "page_no": None,
+        "question_number": question_number,
+        "question": clean_exam_text(question_text),
+        "options": [clean_exam_text(option) for option in options],
+        "img": None,
+    }
 
 
 def _split_embedded_question_text(text: str) -> list[str]:

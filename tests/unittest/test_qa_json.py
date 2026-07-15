@@ -129,6 +129,36 @@ def test_clean_exam_text_normalizes_math_glyphs_and_broken_sub_tags():
     assert "<sub>" not in cleaned
 
 
+def test_model_output_with_merged_questions_is_split_into_separate_objects():
+    payload = extract_with_model(
+        "1. raw",
+        ".",
+        "questions",
+        model_name="qa-model",
+        model_caller=lambda model, messages: json.dumps(
+            {
+                "questions": [
+                    {
+                        "page_no": None,
+                        "question_number": 1,
+                        "question": "1. First question text\n(a) One (b) Two (c) Three (d) Four\n2. Second question text",
+                        "options": ["(a) Five", "(b) Six", "(c) Seven", "(d) Eight"],
+                        "img": None,
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert len(payload["questions"]) == 2
+    assert payload["questions"][0]["question_number"] == 1
+    assert payload["questions"][0]["question"] == "First question text"
+    assert payload["questions"][0]["options"] == ["(a) One", "(b) Two", "(c) Three", "(d) Four"]
+    assert payload["questions"][1]["question_number"] == 2
+    assert payload["questions"][1]["question"] == "Second question text"
+    assert payload["questions"][1]["options"] == ["(a) Five", "(b) Six", "(c) Seven", "(d) Eight"]
+
+
 def test_model_output_cleanup_applies_to_questions_and_answers():
     question_payload = extract_with_model(
         "1. raw",
